@@ -25,8 +25,7 @@ def generate_project_template(output_path):
         "version": "1.0.0",
         "source_dirs": ["src"],
         "include_dirs": ["include"],
-        "third_party_deps": [],
-        "internal_deps": [],
+        "dependencies": [],
         "executable": {
             "compile": True,
             "entry_file": "src/main.cpp"

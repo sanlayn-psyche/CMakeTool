@@ -3,6 +3,7 @@ import os
 import glob
 import sys
 import argparse
+import re
 
 class CMakeGenerator:
     def __init__(self, root_dir):
@@ -12,6 +13,12 @@ class CMakeGenerator:
 
     def get_relative_path(self, target_path, base_path):
         return os.path.relpath(target_path, base_path).replace("\\", "/")
+
+    def expand_env_vars(self, path):
+        # Support ${VAR} and %VAR%
+        path = re.sub(r'\$\{([A-Za-z0-9_]+)\}', lambda m: os.environ.get(m.group(1), ""), path)
+        path = re.sub(r'%([A-Za-z0-9_]+)%', lambda m: os.environ.get(m.group(1), ""), path)
+        return path
 
     def collect_source_files(self, project_dir, source_dirs):
         sources = []
@@ -57,6 +64,28 @@ class CMakeGenerator:
             
         return "UNKNOWN", None
 
+    def resolve_dependency(self, dep_path, project_dir):
+        # Resolve path: Check absolute, then relative to project, then relative to 3rdparty
+        resolved_path = dep_path
+        if not os.path.isabs(resolved_path):
+            # Try relative to project
+            p = os.path.join(project_dir, dep_path)
+            if os.path.exists(p):
+                resolved_path = os.path.abspath(p)
+            else:
+                # Try relative to 3rdparty
+                p = os.path.join(self.third_party_dir, dep_path)
+                if os.path.exists(p):
+                    resolved_path = os.path.abspath(p)
+                else:
+                    return None, None, None
+
+        if not os.path.isdir(resolved_path):
+             return None, None, None
+
+        method, location = self.check_import_method(resolved_path)
+        return resolved_path, method, location
+
     def process_project(self, project_dir, is_root=False):
         project_dir = os.path.abspath(project_dir)
         project_json_path = os.path.join(project_dir, "Project.json")
@@ -88,69 +117,55 @@ class CMakeGenerator:
         
         self.processed_projects[project_json_path] = primary_target
 
-        # Resolve internal dependencies recursively
-        internal_deps_targets = []
-        internal_deps_dirs = []
+        # Combine internal and third-party dependencies
+        raw_deps = data.get("dependencies", [])
         
-        for dep_dir in data.get("internal_deps", []):
-            abs_dep_dir = os.path.abspath(os.path.join(project_dir, dep_dir))
-            dep_target = self.process_project(abs_dep_dir, is_root=False)
-            if dep_target:
-                internal_deps_targets.append(dep_target)
-                internal_deps_dirs.append(abs_dep_dir)
+        valid_deps_targets = []
+        dep_cmake_cmds = []
 
-        # Resolve third party dependencies
-        # We need to determine HOW to import them: find_package or add_subdirectory
-        third_party_targets = []
-        
-        # Lists to hold CMake commands to inject
-        tp_cmake_cmds = []
-
-        for tp in data.get("third_party_deps", []):
-            # Resolve path
-            abs_tp_path = os.path.abspath(os.path.join(project_dir, tp))
-            if not os.path.isdir(abs_tp_path):
-                abs_tp_path = os.path.abspath(os.path.join(self.third_party_dir, tp))
+        for dep in raw_deps:
+            # Expand env vars
+            dep = self.expand_env_vars(dep)
             
-            if not os.path.isdir(abs_tp_path):
-                 print(f"Error: Third party dependency '{tp}' not found.")
+            abs_dep_path, method, location = self.resolve_dependency(dep, project_dir)
+            
+            if not abs_dep_path:
+                 print(f"Error: Dependency '{dep}' not found.")
                  sys.exit(1)
             
-            tp_name = os.path.basename(abs_tp_path)
-            method, location = self.check_import_method(abs_tp_path)
-            
+            dep_name = os.path.basename(abs_dep_path)
             escaped_loc = location.replace('\\', '/') if location else ""
-            escaped_tp_path = abs_tp_path.replace('\\', '/')
+            escaped_dep_path = abs_dep_path.replace('\\', '/')
 
             if method == "MODULE":
                 # Find<Name>.cmake found
-                tp_cmake_cmds.append(f"list(APPEND CMAKE_MODULE_PATH \"{escaped_tp_path}\")")
-                tp_cmake_cmds.append(f"find_package({tp_name} REQUIRED)")
-                third_party_targets.append(tp_name) # Assuming target name matches package name
+                dep_cmake_cmds.append(f"list(APPEND CMAKE_MODULE_PATH \"{escaped_dep_path}\")")
+                dep_cmake_cmds.append(f"find_package({dep_name} REQUIRED)")
+                valid_deps_targets.append(dep_name)
                 
             elif method == "CONFIG":
                 # Config file found
-                tp_cmake_cmds.append(f"find_package({tp_name} REQUIRED PATHS \"{escaped_loc}\")")
-                third_party_targets.append(tp_name) # Assuming target name matches package
+                dep_cmake_cmds.append(f"find_package({dep_name} REQUIRED PATHS \"{escaped_loc}\")")
+                valid_deps_targets.append(dep_name)
                 
             elif method == "SOURCE":
                 # CMakeLists.txt found
-                # Add subdirectory. Use binary dir to support out-of-tree
-                tp_cmake_cmds.append(f"add_subdirectory(\"{escaped_tp_path}\" \"${{CMAKE_BINARY_DIR}}/3rdparty/{tp_name}\")")
-                third_party_targets.append(tp_name) # Assuming target name matches dir
+                dep_cmake_cmds.append(f"if(NOT TARGET {dep_name})")
+                dep_cmake_cmds.append(f"    add_subdirectory(\"{escaped_dep_path}\" \"${{CMAKE_BINARY_DIR}}/deps/{dep_name}\")")
+                dep_cmake_cmds.append(f"endif()")
+                valid_deps_targets.append(dep_name)
                 
             elif method == "PROJECT":
                 # Project.json found. Recursively generate it!
-                # Treat it similar to internal dep but it lives in 3rdparty
-                # We need to process it to generate its CMakeLists.txt
-                # BUT, process_project returns the target name.
-                tp_target = self.process_project(abs_tp_path, is_root=False)
+                dep_target = self.process_project(abs_dep_path, is_root=False)
                 # Now add it
-                tp_cmake_cmds.append(f"add_subdirectory(\"{escaped_tp_path}\" \"${{CMAKE_BINARY_DIR}}/3rdparty/{tp_name}\")")
-                if tp_target:
-                    third_party_targets.append(tp_target)
+                dep_cmake_cmds.append(f"if(NOT TARGET {dep_target})")
+                dep_cmake_cmds.append(f"    add_subdirectory(\"{escaped_dep_path}\" \"${{CMAKE_BINARY_DIR}}/deps/{dep_name}\")")
+                dep_cmake_cmds.append(f"endif()")
+                if dep_target:
+                    valid_deps_targets.append(dep_target)
             else:
-                print(f"Error: Could not determine how to import 3rdparty dependency '{tp_name}' at {abs_tp_path}")
+                print(f"Error: Could not determine how to import dependency '{dep_name}' at {abs_dep_path}")
                 sys.exit(1)
 
         sources = self.collect_source_files(project_dir, data.get("source_dirs", []))
@@ -186,60 +201,24 @@ class CMakeGenerator:
         # Actually, standard CMake practice: check if target exists, if not add_subdirectory.
         # This allows both standalone and solution builds.
         
-        if internal_deps_dirs:
-            for idep_dir in internal_deps_dirs:
-                rel_path = self.get_relative_path(idep_dir, project_dir) # Use relative if possible? No, abs is safer for out-of-tree.
-                # Actually, internal deps are usually relative.
-                # Let's use absolute path for add_subdirectory to be safe.
-                abs_idep = idep_dir.replace('\\', '/')
-                idep_name = os.path.basename(idep_dir) # simple name for binary dir
-                
-                # We need a unique binary directory.
-                # If we are root, we can just add them. 
-                # If we are added by someone else, they might have added them.
-                # Guarding with NOT TARGET is tricky if we don't know the exact target name beforehand (though we do have it from process_project).
-                # But we have `internal_deps_targets` corresponding to dirs.
-                # Let's just add the commands. CMake handles multiple add_subdirectory calls to the same dir gracefully? 
-                # No, it errors if added twice to same binary dir usually, or defines targets twice.
-                # We'll use: if(NOT TARGET TargetName) add_subdirectory(...) endif()
-                
-                # NOTE: We can't easily know the TargetName BEFORE processing, but we just processed it!
-                # `internal_deps_targets` has the names.
-                # Wait, this loop needs to match targets to dirs.
-                # Let's iterate together.
-                pass 
+ 
 
-        # We will add Third Party commands first
-        if tp_cmake_cmds:
-            cmake_content.extend(tp_cmake_cmds)
+        if dep_cmake_cmds:
+            cmake_content.extend(dep_cmake_cmds)
             cmake_content.append("")
-
-        # Now Internal Deps
-        # We only add_subdirectory if we are the ROOT project being processed or if we want to ensure standalone builds work.
-        # The user said "All ... included in the FINAL solution".
-        # If this CMakeLists.txt is the entry point, it must add them.
-        # If it's a child, it shouldn't add them if the parent already did.
-        # Using `if(NOT TARGET ...)` is the standard way to handle diamond dependencies / shared deps.
-        for idx, idep_dir in enumerate(internal_deps_dirs):
-            target_name = internal_deps_targets[idx]
-            abs_idep = idep_dir.replace('\\', '/')
-            # Binary dir needs to be unique relative to build.
-            # We can use CMAKE_BINARY_DIR/internal/TargetName
-            cmake_content.append(f"if(NOT TARGET {target_name})")
-            cmake_content.append(f"    add_subdirectory(\"{abs_idep}\" \"${{CMAKE_BINARY_DIR}}/internal/{target_name}\")")
-            cmake_content.append(f"endif()")
         cmake_content.append("")
 
-        # Include dirs
         raw_include_dirs = data.get("include_dirs", [])
         include_dirs = []
         for idir in raw_include_dirs:
+            # Expand env vars first
+            idir = self.expand_env_vars(idir)
             # Resolve to absolute path immediately
             abs_idir = os.path.abspath(os.path.join(project_dir, idir)).replace('\\', '/')
             include_dirs.append(abs_idir)
 
         # Combine linker dependencies
-        all_deps = internal_deps_targets + third_party_targets
+        all_deps = valid_deps_targets
 
         # Add Library target
         if should_compile_lib:
@@ -258,12 +237,10 @@ class CMakeGenerator:
                     cmake_content.append(f"    $<INSTALL_INTERFACE:include>")
                 cmake_content.append(")")
             
-            if internal_deps_targets or third_party_targets:
+            if valid_deps_targets:
                 cmake_content.append(f"target_link_libraries({lib_name} PRIVATE")
-                for dep in internal_deps_targets:
+                for dep in valid_deps_targets:
                     cmake_content.append(f"    {dep}")
-                for dep in third_party_targets:
-                    cmake_content.append(f"    $<BUILD_INTERFACE:{dep}>")
                 cmake_content.append(")")
             
             # Export and Install logic
