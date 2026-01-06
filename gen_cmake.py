@@ -64,10 +64,6 @@ class CMakeGenerator:
         if os.path.exists(os.path.join(tp_path, "CMakeLists.txt")):
             return "SOURCE", tp_path
         
-        # 3. CMake Source: Look for CMakeLists.txt
-        if os.path.exists(os.path.join(tp_path, "CMakeLists.txt")):
-            return "SOURCE", tp_path
-            
         return "UNKNOWN", None
 
     def resolve_dependency(self, dep_path, project_dir):
