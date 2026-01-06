@@ -35,6 +35,12 @@ class CMakeGenerator:
         return sorted(list(set(sources)))
 
     def check_import_method(self, tp_path):
+        # 0. Project JSON: Look for Project.json (HIGHEST PRIORITY)
+        # If a Project.json exists, we want to control the build using our tool, 
+        # regardless of whether other build files (generated or not) exist.
+        if os.path.exists(os.path.join(tp_path, "Project.json")):
+            return "PROJECT", tp_path
+
         # 1. Module Mode: Look for Find<Name>.cmake
         tp_name = os.path.basename(tp_path)
         if os.path.exists(os.path.join(tp_path, f"Find{tp_name}.cmake")):
@@ -58,9 +64,9 @@ class CMakeGenerator:
         if os.path.exists(os.path.join(tp_path, "CMakeLists.txt")):
             return "SOURCE", tp_path
         
-        # 4. Project JSON: Look for Project.json
-        if os.path.exists(os.path.join(tp_path, "Project.json")):
-            return "PROJECT", tp_path
+        # 3. CMake Source: Look for CMakeLists.txt
+        if os.path.exists(os.path.join(tp_path, "CMakeLists.txt")):
+            return "SOURCE", tp_path
             
         return "UNKNOWN", None
 
