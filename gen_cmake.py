@@ -231,7 +231,12 @@ class CMakeGenerator:
         cmake_content.append("")
 
         # Include dirs
-        include_dirs = data.get("include_dirs", [])
+        raw_include_dirs = data.get("include_dirs", [])
+        include_dirs = []
+        for idir in raw_include_dirs:
+            # Resolve to absolute path immediately
+            abs_idir = os.path.abspath(os.path.join(project_dir, idir)).replace('\\', '/')
+            include_dirs.append(abs_idir)
 
         # Combine linker dependencies
         all_deps = internal_deps_targets + third_party_targets
@@ -249,7 +254,7 @@ class CMakeGenerator:
             if include_dirs:
                 cmake_content.append(f"target_include_directories({lib_name} PUBLIC")
                 for idir in include_dirs:
-                    cmake_content.append(f"    $<BUILD_INTERFACE:${{CMAKE_CURRENT_SOURCE_DIR}}/{idir}>")
+                    cmake_content.append(f"    $<BUILD_INTERFACE:{idir}>")
                     cmake_content.append(f"    $<INSTALL_INTERFACE:include>")
                 cmake_content.append(")")
             
