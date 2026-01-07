@@ -39,32 +39,65 @@ class CMakeGenerator:
         # If a Project.json exists, we want to control the build using our tool, 
         # regardless of whether other build files (generated or not) exist.
         if os.path.exists(os.path.join(tp_path, "Project.json")):
-            return "PROJECT", tp_path
+            return "PROJECT", tp_path, os.path.basename(tp_path)
 
         # 1. Module Mode: Look for Find<Name>.cmake
         tp_name = os.path.basename(tp_path)
         if os.path.exists(os.path.join(tp_path, f"Find{tp_name}.cmake")):
-             return "MODULE", tp_path
+             return "MODULE", tp_path, tp_name
+        
+        # Also check for case-insensitive Find matches or common variants? 
+        # For now, stick to direct.
         
         # 2. Config Mode: Look for *Config.cmake recursively
         # We limit depth to avoid excessive scanning, e.g. 3 levels
         # Common paths: ., lib/cmake/<name>, share/cmake/<name>, cmake
+        tp_name_lower = tp_name.lower()
+        
+        # If tp_name looks like a version (e.g. "7.9.3"), try using parent dir name too
+        parent_name = os.path.basename(os.path.dirname(tp_path))
+        parent_name_lower = parent_name.lower()
+        is_version_dir = any(c.isdigit() for c in tp_name) and '.' in tp_name
+
+        ignore_configs = ["ctestconfig.cmake", "cpackconfig.cmake", "ctestcustom.cmake"]
+        
         for root, dirs, files in os.walk(tp_path):
             # Check files
             for f in files:
-                if f.lower().endswith("config.cmake") or f.lower().endswith("-config.cmake"):
-                    return "CONFIG", root
+                f_lower = f.lower()
+                if f_lower in ignore_configs:
+                    continue
+                
+                if f_lower.endswith("config.cmake") or f_lower.endswith("-config.cmake"):
+                    # Extract the potential package name from the filename
+                    # e.g., OpenCASCADEConfig.cmake -> OpenCASCADE
+                    # e.g., eigen-config.cmake -> eigen
+                    current_pkg_name = f[:f_lower.find("config.cmake")].rstrip("-")
+                    if not current_pkg_name:
+                         current_pkg_name = tp_name # fallback
+
+                    # Check if the config file name matches the dependency name
+                    matched = False
+                    # Match against folder name
+                    if f_lower == f"{tp_name_lower}config.cmake" or f_lower == f"{tp_name_lower}-config.cmake" or tp_name_lower in f_lower:
+                        matched = True
+                    # Match against parent folder name if current is a version
+                    elif is_version_dir and (f_lower == f"{parent_name_lower}config.cmake" or f_lower == f"{parent_name_lower}-config.cmake" or parent_name_lower in f_lower):
+                        matched = True
+                        
+                    if matched:
+                        return "CONFIG", root, current_pkg_name
             
             # optimization: don't go too deep or into build dirs
             depth = root[len(tp_path):].count(os.sep)
-            if depth > 3:
+            if depth > 5:
                 del dirs[:] 
         
         # 3. CMake Source: Look for CMakeLists.txt
         if os.path.exists(os.path.join(tp_path, "CMakeLists.txt")):
-            return "SOURCE", tp_path
+            return "SOURCE", tp_path, tp_name
         
-        return "UNKNOWN", None
+        return "UNKNOWN", None, tp_name
 
     def resolve_dependency(self, dep_path, project_dir):
         # Resolve path: Check absolute, then relative to project, then relative to 3rdparty
@@ -85,8 +118,8 @@ class CMakeGenerator:
         if not os.path.isdir(resolved_path):
              return None, None, None
 
-        method, location = self.check_import_method(resolved_path)
-        return resolved_path, method, location
+        method, location, pkg_name = self.check_import_method(resolved_path)
+        return resolved_path, method, location, pkg_name
 
     def process_project(self, project_dir, is_root=False):
         project_dir = os.path.abspath(project_dir)
@@ -129,13 +162,24 @@ class CMakeGenerator:
             # Expand env vars
             dep = self.expand_env_vars(dep)
             
-            abs_dep_path, method, location = self.resolve_dependency(dep, project_dir)
+            # Normalize path and remove trailing slashes
+            dep = os.path.normpath(dep)
+            
+            abs_dep_path, method, location, pkg_name = self.resolve_dependency(dep, project_dir)
             
             if not abs_dep_path:
                  print(f"Error: Dependency '{dep}' not found.")
                  sys.exit(1)
             
-            dep_name = os.path.basename(abs_dep_path)
+            # Skip if the dependency is the project itself
+            if abs_dep_path == project_dir:
+                print(f"Note: Skipping self-referential dependency: {dep}")
+                continue
+            
+            dep_name = pkg_name or os.path.basename(abs_dep_path)
+            # If name is still a version string, try harder? 
+            # But pkg_name should have caught it for CONFIG mode.
+
             escaped_loc = location.replace('\\', '/') if location else ""
             escaped_dep_path = abs_dep_path.replace('\\', '/')
 
@@ -148,7 +192,25 @@ class CMakeGenerator:
             elif method == "CONFIG":
                 # Config file found
                 dep_cmake_cmds.append(f"find_package({dep_name} REQUIRED PATHS \"{escaped_loc}\")")
-                valid_deps_targets.append(dep_name)
+                # Add it to the list of things to link. 
+                # Use the variable ${dep_name}_LIBRARIES if it exists, otherwise just the name.
+                # Also handle include directories which might be in variables.
+                dep_target = f"${{{dep_name}_LIBRARIES}}" if dep_name != "eigen" else dep_name
+                # Note: eigen is a special case where we often prefer the target name.
+                # But for most CONFIG packages (like OCCT), ${Name_LIBRARIES} is safer.
+                
+                # We'll use a trick: if ${Name_LIBRARIES} is empty, use Name
+                link_name = f"$<IF:$<BOOL:${{{dep_name}_LIBRARIES}}>,${{{dep_name}_LIBRARIES}},{dep_name}>"
+                valid_deps_targets.append(link_name)
+                
+                # For include dirs, since we can't easily add them to target_include_directories 
+                # after the fact in this script's structure without major refactor, 
+                # we'll use include_directories (global) or add to include_dirs list.
+                dep_cmake_cmds.append(f"if({dep_name}_INCLUDE_DIRS)")
+                dep_cmake_cmds.append(f"    include_directories(${{{dep_name}_INCLUDE_DIRS}})")
+                dep_cmake_cmds.append(f"elif({dep_name}_INCLUDE_DIR)")
+                dep_cmake_cmds.append(f"    include_directories(${{{dep_name}_INCLUDE_DIR}})")
+                dep_cmake_cmds.append(f"endif()")
                 
             elif method == "SOURCE":
                 # CMakeLists.txt found
@@ -242,7 +304,7 @@ class CMakeGenerator:
             if valid_deps_targets:
                 cmake_content.append(f"target_link_libraries({lib_name} PRIVATE")
                 for dep in valid_deps_targets:
-                    cmake_content.append(f"    {dep}")
+                    cmake_content.append(f"    $<BUILD_INTERFACE:{dep}>")
                 cmake_content.append(")")
             
             # Export and Install logic
