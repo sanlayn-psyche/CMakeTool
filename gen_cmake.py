@@ -4,8 +4,17 @@ import glob
 import sys
 import argparse
 import re
+import platform
 
 class CMakeGenerator:
+    @staticmethod
+    def load_json(file_path):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            # Remove trailing commas in arrays and objects
+            content = re.sub(r',\s*([\]}])', r'\1', content)
+            return json.loads(content)
+
     def __init__(self, root_dir):
         self.root_dir = os.path.abspath(root_dir)
         self.third_party_dir = os.path.join(self.root_dir, "3rdparty")
@@ -50,15 +59,20 @@ class CMakeGenerator:
         # For now, stick to direct.
         
         # 2. Config Mode: Look for *Config.cmake recursively
-        # We limit depth to avoid excessive scanning, e.g. 3 levels
-        # Common paths: ., lib/cmake/<name>, share/cmake/<name>, cmake
+        tp_name = os.path.basename(tp_path)
         tp_name_lower = tp_name.lower()
         
-        # If tp_name looks like a version (e.g. "7.9.3"), try using parent dir name too
+        # Clean the name for better matching (e.g. vtk-9.4.1-x64 -> vtk)
+        clean_name = re.sub(r'[-_]?(?:vc|gcc|clang|win|linux|mac)?\d+(?:[\.-]\d+)*.*$', '', tp_name, flags=re.IGNORECASE)
+        if not clean_name:
+            clean_name = tp_name
+        clean_name_lower = clean_name.lower()
+
         parent_name = os.path.basename(os.path.dirname(tp_path))
         parent_name_lower = parent_name.lower()
         is_version_dir = any(c.isdigit() for c in tp_name) and '.' in tp_name
 
+        candidates = []
         ignore_configs = ["ctestconfig.cmake", "cpackconfig.cmake", "ctestcustom.cmake"]
         
         for root, dirs, files in os.walk(tp_path):
@@ -69,33 +83,48 @@ class CMakeGenerator:
                     continue
                 
                 if f_lower.endswith("config.cmake") or f_lower.endswith("-config.cmake"):
-                    # Extract the potential package name from the filename
-                    # e.g., OpenCASCADEConfig.cmake -> OpenCASCADE
-                    # e.g., eigen-config.cmake -> eigen
                     current_pkg_name = f[:f_lower.find("config.cmake")].rstrip("-")
                     if not current_pkg_name:
-                         current_pkg_name = tp_name # fallback
-
-                    # Check if the config file name matches the dependency name
-                    matched = False
-                    # Match against folder name
-                    if f_lower == f"{tp_name_lower}config.cmake" or f_lower == f"{tp_name_lower}-config.cmake" or tp_name_lower in f_lower:
-                        matched = True
-                    # Match against parent folder name if current is a version
-                    elif is_version_dir and (f_lower == f"{parent_name_lower}config.cmake" or f_lower == f"{parent_name_lower}-config.cmake" or parent_name_lower in f_lower):
-                        matched = True
-                        
-                    if matched:
-                        return "CONFIG", root, current_pkg_name
+                         current_pkg_name = tp_name
+                    
+                    # Store candidate with a score
+                    score = 0
+                    if f_lower == f"{clean_name_lower}config.cmake" or f_lower == f"{clean_name_lower}-config.cmake":
+                        score = 10
+                    elif f_lower == f"{tp_name_lower}config.cmake" or f_lower == f"{tp_name_lower}-config.cmake":
+                        score = 9
+                    elif clean_name_lower in f_lower:
+                        score = 7
+                    elif tp_name_lower in f_lower:
+                        score = 5
+                    elif is_version_dir and (f_lower == f"{parent_name_lower}config.cmake" or parent_name_lower in f_lower):
+                        score = 8
+                    
+                    candidates.append({"name": current_pkg_name, "root": root, "score": score})
             
             # optimization: don't go too deep or into build dirs
             depth = root[len(tp_path):].count(os.sep)
             if depth > 5:
                 del dirs[:] 
         
+        if candidates:
+            # Pick best candidate
+            best = max(candidates, key=lambda x: x["score"])
+            return "CONFIG", best["root"], best["name"]
+        
         # 3. CMake Source: Look for CMakeLists.txt
         if os.path.exists(os.path.join(tp_path, "CMakeLists.txt")):
             return "SOURCE", tp_path, tp_name
+        
+        # 4. Root Mode: Look for include/ and lib/
+        if os.path.isdir(os.path.join(tp_path, "include")) and os.path.isdir(os.path.join(tp_path, "lib")):
+            # Heuristic: Clean the name (already done above but scope issue if we rely on it)
+            # Re-calculate clean name just in case checks above didn't pass or we are in a separate logic block,
+            # but ideally we should reuse logic. Here we just use the regex again.
+            clean_name_root = re.sub(r'[-_]?(?:vc|gcc|clang|win|linux|mac)?\d+(?:[\.-]\d+)*.*$', '', tp_name, flags=re.IGNORECASE)
+            if not clean_name_root:
+                clean_name_root = tp_name
+            return "ROOT", tp_path, clean_name_root
         
         return "UNKNOWN", None, tp_name
 
@@ -132,8 +161,7 @@ class CMakeGenerator:
         if project_json_path in self.processed_projects:
             return self.processed_projects[project_json_path]
 
-        with open(project_json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = self.load_json(project_json_path)
 
         name = data["name"]
         version = data.get("version", "1.0.0")
@@ -155,11 +183,40 @@ class CMakeGenerator:
         # Combine internal and third-party dependencies
         raw_deps = data.get("dependencies", [])
         
+        # Pre-process dependencies to handle wildcards
+        all_deps = []
+        for raw_dep in raw_deps:
+            # Expand env vars first to check path
+            dep_expanded = self.expand_env_vars(raw_dep)
+            norm_dep = os.path.normpath(dep_expanded)
+            
+            if norm_dep.endswith("*"):
+                # Wildcard detected
+                base_dir = os.path.dirname(norm_dep)
+                if os.path.isdir(base_dir):
+                    # Found directory, list all subdirectories
+                    found_any = False
+                    for entry in os.listdir(base_dir):
+                        full_path = os.path.join(base_dir, entry)
+                        if os.path.isdir(full_path):
+                            all_deps.append(full_path)
+                            found_any = True
+                    if not found_any:
+                        print(f"Warning: No subdirectories found in wildcard path '{dep_expanded}'")
+                else:
+                    print(f"Warning: Wildcard base directory '{base_dir}' not found for dependency '{raw_dep}'")
+            else:
+                # Normal dependency
+                all_deps.append(dep_expanded)
+
         valid_deps_targets = []
         dep_cmake_cmds = []
+        dll_copy_dirs = []
 
-        for dep in raw_deps:
-            # Expand env vars
+        for dep in all_deps:
+            # Note: dep is already expanded env vars, but self.expand_env_vars is idempotent usually.
+            # We keep the logic consistent.
+            dep = self.expand_env_vars(dep)
             dep = self.expand_env_vars(dep)
             
             # Normalize path and remove trailing slashes
@@ -177,6 +234,17 @@ class CMakeGenerator:
                 continue
             
             dep_name = pkg_name or os.path.basename(abs_dep_path)
+
+            # DLL Auto-Discovery Logic
+            potential_bin_dirs = [
+                os.path.join(abs_dep_path, "bin"), # Standard
+                os.path.join(abs_dep_path, "win64", "vc14", "bin"), # OCCT Standard
+                os.path.join(abs_dep_path, "lib") # Fallback
+            ]
+            for pbd in potential_bin_dirs:
+                if os.path.exists(pbd) and glob.glob(os.path.join(pbd, "*.dll")):
+                    dll_copy_dirs.append(pbd.replace('\\', '/'))
+                    break
             # If name is still a version string, try harder? 
             # But pkg_name should have caught it for CONFIG mode.
 
@@ -185,22 +253,23 @@ class CMakeGenerator:
 
             if method == "MODULE":
                 # Find<Name>.cmake found
-                dep_cmake_cmds.append(f"list(APPEND CMAKE_MODULE_PATH \"{escaped_dep_path}\")")
+                dep_cmake_cmds.append(f"list(APPEND CMAKE_MODULE_PATH \"{escaped_loc}\")")
+                dep_cmake_cmds.append(f"list(APPEND CMAKE_PREFIX_PATH \"{escaped_dep_path}\")")
+                dep_cmake_cmds.append(f"set({dep_name}_ROOT \"{escaped_dep_path}\")")
                 dep_cmake_cmds.append(f"find_package({dep_name} REQUIRED)")
                 valid_deps_targets.append(dep_name)
                 
             elif method == "CONFIG":
                 # Config file found
-                dep_cmake_cmds.append(f"find_package({dep_name} REQUIRED PATHS \"{escaped_loc}\")")
-                # Add it to the list of things to link. 
-                # Use the variable ${dep_name}_LIBRARIES if it exists, otherwise just the name.
-                # Also handle include directories which might be in variables.
-                dep_target = f"${{{dep_name}_LIBRARIES}}" if dep_name != "eigen" else dep_name
-                # Note: eigen is a special case where we often prefer the target name.
-                # But for most CONFIG packages (like OCCT), ${Name_LIBRARIES} is safer.
-                
-                # We'll use a trick: if ${Name_LIBRARIES} is empty, use Name
-                link_name = f"$<IF:$<BOOL:${{{dep_name}_LIBRARIES}}>,${{{dep_name}_LIBRARIES}},{dep_name}>"
+                dep_cmake_cmds.append(f"list(APPEND CMAKE_PREFIX_PATH \"{escaped_dep_path}\")")
+                dep_cmake_cmds.append(f"list(APPEND CMAKE_PREFIX_PATH \"{escaped_loc}\")")
+                dep_cmake_cmds.append(f"set({dep_name}_ROOT \"{escaped_dep_path}\")")
+                dep_cmake_cmds.append(f"find_package({dep_name} REQUIRED)")
+                # Use standard variable or target name
+                # If ${dep_name}_LIBRARIES is defined, use it.
+                # Else check if checks if a target with ${dep_name} exists.
+                # If neither, link nothing (avoids LNK1104 for non-target package names).
+                link_name = f"$<IF:$<BOOL:${{{dep_name}_LIBRARIES}}>,${{{dep_name}_LIBRARIES}},$<TARGET_NAME_IF_EXISTS:{dep_name}>>"
                 valid_deps_targets.append(link_name)
                 
                 # For include dirs, since we can't easily add them to target_include_directories 
@@ -208,7 +277,7 @@ class CMakeGenerator:
                 # we'll use include_directories (global) or add to include_dirs list.
                 dep_cmake_cmds.append(f"if({dep_name}_INCLUDE_DIRS)")
                 dep_cmake_cmds.append(f"    include_directories(${{{dep_name}_INCLUDE_DIRS}})")
-                dep_cmake_cmds.append(f"elif({dep_name}_INCLUDE_DIR)")
+                dep_cmake_cmds.append(f"elseif({dep_name}_INCLUDE_DIR)")
                 dep_cmake_cmds.append(f"    include_directories(${{{dep_name}_INCLUDE_DIR}})")
                 dep_cmake_cmds.append(f"endif()")
                 
@@ -228,23 +297,45 @@ class CMakeGenerator:
                 dep_cmake_cmds.append(f"endif()")
                 if dep_target:
                     valid_deps_targets.append(dep_target)
+            elif method == "ROOT":
+                # Raw package found (include/ + lib/) without Config/Find module.
+                # Strictly import headers and link all found libraries.
+                
+                # Add include directory
+                dep_cmake_cmds.append(f"include_directories(\"{escaped_dep_path}/include\")")
+                
+                # Find libraries
+                # We assume Windows (.lib) for now based on environment. 
+                # For cross-platform, we would add .a and .so
+                lib_var = f"{dep_name}_LIBRARIES"
+                dep_cmake_cmds.append(f"file(GLOB {lib_var} \"{escaped_dep_path}/lib/*.lib\")")
+                
+                # Add to targets
+                valid_deps_targets.append(f"${{{lib_var}}}")
             else:
-                print(f"Error: Could not determine how to import dependency '{dep_name}' at {abs_dep_path}")
-                sys.exit(1)
+                print(f"Warning: Could not determine how to import dependency '{dep_name}' at {abs_dep_path}. Skipping.")
+                continue
 
         sources = self.collect_source_files(project_dir, data.get("source_dirs", []))
         
         cmake_content = [
-            f"cmake_minimum_required(VERSION 3.10)",
+            f"cmake_minimum_required(VERSION 3.12)",
             f"project({name} VERSION {version})",
+            "",
+            # Enable compatibility with older projects in CMake 4.0
+            "if(POLICY CMP0000)",
+            "    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)",
+            "endif()",
             "",
             f"add_definitions(-DRootPath=\"{project_dir.replace('\\', '/')}\")",
             ""
         ]
 
         # Use C++17 by default for consistency
-        cmake_content.append("set(CMAKE_CXX_STANDARD 17)")
-        cmake_content.append("set(CMAKE_CXX_STANDARD_REQUIRED ON)")
+        # C++ Standard
+        cpp_std = data.get("cpp_standard", 17)
+        cmake_content.append(f"set(CMAKE_CXX_STANDARD {cpp_std})")
+        cmake_content.append(f"set(CMAKE_CXX_STANDARD_REQUIRED ON)")
         cmake_content.append("")
 
         # Handle explicit install prefix
@@ -368,6 +459,24 @@ class CMakeGenerator:
             for dep in all_deps:
                 cmake_content.append(f"    {dep}")
             cmake_content.append(")")
+
+            # Add Post-Build Auto-Copy for DLLs
+            if dll_copy_dirs:
+                cmake_content.append("")
+                cmake_content.append(f"# Auto-copy Dependency DLLs to Output Directory")
+                # Deduplicate directories
+                unique_dll_dirs = list(set(dll_copy_dirs))
+                for i, d in enumerate(unique_dll_dirs):
+                    var_name = f"DEP_DLLS_{i}"
+                    cmake_content.append(f"file(GLOB {var_name} \"{d}/*.dll\")")
+                    cmake_content.append(f"foreach(dll ${{{var_name}}})")
+                    cmake_content.append(f"    add_custom_command(TARGET {name} POST_BUILD")
+                    cmake_content.append(f"        COMMAND ${{CMAKE_COMMAND}} -E copy_if_different")
+                    cmake_content.append(f"        \"${{dll}}\"")
+                    cmake_content.append(f"        \"$<TARGET_FILE_DIR:{name}>\"")
+                    cmake_content.append(f"    )")
+                    cmake_content.append(f"endforeach()")
+
             cmake_content.append("")
 
         cmake_path = os.path.join(project_dir, "CMakeLists.txt")
@@ -380,8 +489,7 @@ class CMakeGenerator:
     def process_solution(self, solution_json_path):
         solution_json_path = os.path.abspath(solution_json_path)
         solution_dir = os.path.dirname(solution_json_path)
-        with open(solution_json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = self.load_json(solution_json_path)
 
         name = data["name"]
         projects_dirs = data.get("projects", [])
@@ -398,8 +506,12 @@ class CMakeGenerator:
         # We process all listed projects.
         
         root_cmake = [
-            f"cmake_minimum_required(VERSION 3.10)",
+            f"cmake_minimum_required(VERSION 3.12)",
             f"project({name})",
+            "",
+            "if(POLICY CMP0000)",
+            "    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)",
+            "endif()",
             "",
             "set(CMAKE_CXX_STANDARD 17)",
             "set(CMAKE_CXX_STANDARD_REQUIRED ON)",
@@ -446,8 +558,7 @@ def main():
         is_solution = False
     else:
         json_path = input_path
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = CMakeGenerator.load_json(json_path)
         is_solution = "projects" in data
     
     root_dir = os.path.dirname(json_path)
