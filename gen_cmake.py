@@ -178,7 +178,13 @@ class CMakeGenerator:
         elif should_compile_exec:
             primary_target = name
         
-        self.processed_projects[project_json_path] = primary_target
+        # We process to find deps first, then we can cache fully.
+        # But wait, we need to return valid data.
+        # Ideally we process, THEN cache.
+        # For now, recursive check handles circles?
+        # self.processed_projects[project_json_path] = (primary_target, []) # Placeholder logic if needed?
+        # Actually, let's just proceed and cache at end or handle recursion loop detection separately if needed.
+        # For now, just continue.
 
         # Combine internal and third-party dependencies
         raw_deps = data.get("dependencies", [])
@@ -290,7 +296,11 @@ class CMakeGenerator:
                 
             elif method == "PROJECT":
                 # Project.json found. Recursively generate it!
-                dep_target = self.process_project(abs_dep_path, is_root=False)
+                dep_target, child_dll_dirs = self.process_project(abs_dep_path, is_root=False)
+                
+                # Bubble up transitive DLLs
+                dll_copy_dirs.extend(child_dll_dirs)
+
                 # Now add it
                 dep_cmake_cmds.append(f"if(NOT TARGET {dep_target})")
                 dep_cmake_cmds.append(f"    add_subdirectory(\"{escaped_dep_path}\" \"${{CMAKE_BINARY_DIR}}/deps/{dep_name}\")")
@@ -325,6 +335,10 @@ class CMakeGenerator:
             # Enable compatibility with older projects in CMake 4.0
             "if(POLICY CMP0000)",
             "    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)",
+            "endif()",
+            "",
+            "if(POLICY CMP0079)",
+            "    cmake_policy(SET CMP0079 NEW)",
             "endif()",
             "",
             f"add_definitions(-DRootPath=\"{project_dir.replace('\\', '/')}\")",
@@ -380,7 +394,10 @@ class CMakeGenerator:
             lib_name = f"{name}Lib"
             is_static = lib_config.get("static", True)
             lib_type = "STATIC" if is_static else "SHARED"
-            cmake_content.append(f"add_library({lib_name} {lib_type}")
+            
+            # Idempotency guard for library
+            cmake_content.append(f"if(NOT TARGET {lib_name})")
+            cmake_content.append(f"    add_library({lib_name} {lib_type}")
             for src in sources:
                 cmake_content.append(f"    {src}")
             cmake_content.append(")")
@@ -430,6 +447,8 @@ class CMakeGenerator:
                 
                 cmake_content.append(f"install(FILES {name}Config.cmake")
                 cmake_content.append(f"    DESTINATION lib/cmake/{name})")
+            
+            cmake_content.append("endif()")
             cmake_content.append("")
 
         # Add Executable target
@@ -439,7 +458,8 @@ class CMakeGenerator:
                 print(f"Error: Executable enabled for {name} but no entry_file specified.")
                 sys.exit(1)
             
-            cmake_content.append(f"add_executable({name}")
+            cmake_content.append(f"if(NOT TARGET {name})")
+            cmake_content.append(f"    add_executable({name}")
             cmake_content.append(f"    {entry_file}")
             if not should_compile_lib:
                 for src in sources:
@@ -477,6 +497,7 @@ class CMakeGenerator:
                     cmake_content.append(f"    )")
                     cmake_content.append(f"endforeach()")
 
+            cmake_content.append("endif()") # Close if(NOT TARGET {name})
             cmake_content.append("")
 
         cmake_path = os.path.join(project_dir, "CMakeLists.txt")
@@ -484,7 +505,11 @@ class CMakeGenerator:
             f.write("\n".join(cmake_content))
         
         print(f"Generated {cmake_path}")
-        return primary_target
+
+        # Cache result
+        self.processed_projects[project_json_path] = (primary_target, dll_copy_dirs)
+        
+        return primary_target, dll_copy_dirs
 
     def process_solution(self, solution_json_path):
         solution_json_path = os.path.abspath(solution_json_path)
