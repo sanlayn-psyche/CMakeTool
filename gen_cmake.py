@@ -500,9 +500,19 @@ class CMakeGenerator:
             cmake_content.append("endif()") # Close if(NOT TARGET {name})
             cmake_content.append("")
 
+        # Add custom cmake includes
+        custom_cmakes = data.get("custom_cmake", [])
+        if isinstance(custom_cmakes, str):
+            custom_cmakes = [custom_cmakes]
+        
+        for cc in custom_cmakes:
+            cmake_content.append(f"include(${{CMAKE_CURRENT_LIST_DIR}}/{cc})")
+        cmake_content.append("")
+
         cmake_path = os.path.join(project_dir, "CMakeLists.txt")
         with open(cmake_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(cmake_content))
+
         
         print(f"Generated {cmake_path}")
 
