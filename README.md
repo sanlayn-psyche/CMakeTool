@@ -99,3 +99,7 @@ python gen_cmake.py path/to/Solution.json
 ```json
 "third_party_deps": ["rapidcsv"]
 ```
+
+## TODO 
+
+可以考虑吸收 cargo 的设计模式；
